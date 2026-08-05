@@ -533,8 +533,13 @@ pub fn event_dispatch(event: &EbpfProcEvent, cfg: &AppConfig, state: &mut EbpfSt
         }
 
         EBPF_EVENT_FORK => {
-            // 子线程继承父线程亲和性与 cpuset
-            // 内核态已插入 APPLIED_MAP 占位，RENAME 时触发完整处理
+            // 子线程 fork 时 comm 与父线程相同，立即按父线程的包/线程规则绑核，
+            // 消除等待 RENAME 造成的绑核窗口期；RENAME 时仍会重新计算并修正
+            // （task_apply 仅防线程级降级为包级，RENAME 算出的线程规则可覆盖）
+            if !event_apply(&mut state.cache, &mut state.bpf, tid, pid, comm, cfg) {
+                state.cache.task_del(tid);
+                applied_del(&mut state.bpf, tid);
+            }
         }
 
         EBPF_EVENT_RENAME => {

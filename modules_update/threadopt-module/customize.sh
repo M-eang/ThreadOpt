@@ -54,6 +54,12 @@ module_instructions() {
 	ui_print "线程规则配置文件路径为："
 	ui_print "/data/adb/modules/ThreadOpt/applist.conf"
 	ui_print "------------------------------------------"
+	ui_print "游戏档配置（前台检测到游戏自动切换）："
+	ui_print "/data/adb/modules/ThreadOpt/game.conf"
+	ui_print "------------------------------------------"
+	ui_print "手动锁定档位："
+	ui_print "/data/adb/modules/ThreadOpt/mode  内容 auto/power/game"
+	ui_print "------------------------------------------"
 	ui_print "修改与添加规则无需重启，即时生效"
 	ui_print "********************************************"
 	all_core="$(cat /sys/devices/system/cpu/present)"
@@ -73,6 +79,11 @@ add_default_rules() {
 if [ -f /data/adb/modules/ThreadOpt/applist.conf ]; then
 	mv $MODPATH/applist.conf $MODPATH/applist.conf.bak
 	cp -r /data/adb/modules/ThreadOpt/applist.conf $MODPATH
+fi
+# 游戏档配置同样保留用户已有文件，避免升级覆盖
+if [ -f /data/adb/modules/ThreadOpt/game.conf ]; then
+	mv $MODPATH/game.conf $MODPATH/game.conf.bak
+	cp -r /data/adb/modules/ThreadOpt/game.conf $MODPATH
 fi
 }
 check_magisk_version

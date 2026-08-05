@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod cpuset;
+pub mod mode;
 pub mod rule_match;
 
 use std::sync::Mutex;

@@ -5,13 +5,17 @@ compile_error!("ThreadOpt requires 64-bit target due to cpu_set_t binary layout 
 mod apply_affinity;
 mod cache;
 mod ebpf_mode;
+mod foreground;
 mod proc_mode;
 
+use std::collections::HashSet;
 use std::env;
+use std::ffi::CString;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,11 +28,25 @@ use threadopt::CONFIG_UPDATED;
 use threadopt::config::{CURRENT_CONFIG, config_loader, init_inotify, load_config};
 use threadopt::cpuset::{DEFAULT_CPUSET_NAME, init_cpu_topo, set_base_cpuset};
 use threadopt::lock_ignore_poison;
+use threadopt::mode::{Mode, decide_mode, parse_override};
+
+/// eBPF 失效后每隔该秒数重试恢复，避免永久退化为 /proc 轮询
+const EBPF_RETRY_SECS: u64 = 60;
+
+/// 档位检测线程写：目标档位
+static CURRENT_MODE: Mutex<Mode> = Mutex::new(Mode::Power);
+/// 主循环写：当前生效档位
+static EFFECTIVE_MODE: Mutex<Mode> = Mutex::new(Mode::Power);
+/// 目标档位变化时检测线程置位，主循环消费
+static MODE_CHANGED: AtomicBool = AtomicBool::new(false);
+/// 游戏名单（前台检测用），主循环在游戏配置加载/热加载/切档时更新
+static GAME_PKGS: Mutex<Option<Arc<HashSet<String>>>> = Mutex::new(None);
 
 fn print_help(prog_name: &str) {
     println!("Usage: {} [OPTIONS]", prog_name);
     println!("Options:");
-    println!("  -c <config_file>   指定配置文件 (默认: ./applist.conf)");
+    println!("  -c <config_file>   指定省电档配置文件 (默认: ./applist.conf)");
+    println!("  -g <game_config>   指定游戏档配置文件 (默认: ./game.conf，不存在则档位切换禁用)");
     println!("  -s <interval>      设置检查间隔(秒) (必须>=1, 默认: 2)");
     println!("  -b <cpuset_name>   指定 BASE_CPUSET 目录名 (默认: ThreadOpt)");
     println!("  -v                 显示程序版本");
@@ -37,6 +55,10 @@ fn print_help(prog_name: &str) {
     println!("示例:");
     println!("  {} -c /data/applist.conf -s 3", prog_name);
     println!("  {} -b MyThreadOpt", prog_name);
+    println!();
+    println!("档位切换（自动为主 + 手动兜底）:");
+    println!("  前台检测到 game.conf 中的游戏 → 自动切游戏档；回桌面自动回省电档");
+    println!("  手动锁定：在配置文件同目录建 mode 文件，内容 auto/power/game");
     println!();
     println!("规则格式:");
     println!("  # 注释以 # 或 // 开头");
@@ -54,11 +76,44 @@ fn print_help(prog_name: &str) {
     println!("  线程 Thread-1 绑定到 CPU 0-5");
 }
 
+/// 档位检测线程：前台游戏检测 + 手动 override（mode 文件），档位变化时置 MODE_CHANGED
+fn spawn_mode_detector(mode_file: PathBuf, det_interval: Duration) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let name = CString::new("ModeDetect").unwrap();
+        unsafe {
+            libc::pthread_setname_np(libc::pthread_self(), name.as_ptr());
+        }
+        let mut last_mode = Mode::Power;
+        loop {
+            thread::sleep(det_interval);
+            // 手动 override 优先（mode 文件内容 auto/power/game，缺失或无法识别视为 auto）
+            let override_mode = fs::read_to_string(&mode_file)
+                .ok()
+                .and_then(|c| parse_override(&c));
+            let game_fg = lock_ignore_poison(&GAME_PKGS)
+                .as_ref()
+                .map(|pkgs| foreground::game_foreground(pkgs))
+                .unwrap_or(false);
+            let target = decide_mode(override_mode, game_fg);
+            if target != last_mode {
+                last_mode = target;
+                *lock_ignore_poison(&CURRENT_MODE) = target;
+                MODE_CHANGED.store(true, Ordering::Release);
+                println!(
+                    "档位检测: 切换到 {:?}（前台游戏={}，override={:?}）",
+                    target, game_fg, override_mode
+                );
+            }
+        }
+    })
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let prog_name = &args[0];
 
     let mut config_file = String::from("./applist.conf");
+    let mut game_file = String::from("./game.conf");
     let mut sleep_interval: u64 = 2;
     let mut cpuset_name = String::from(DEFAULT_CPUSET_NAME);
 
@@ -72,6 +127,16 @@ fn main() {
                     println!("配置文件: {}", config_file);
                 } else {
                     eprintln!("错误: -c 需要指定配置文件路径");
+                    process::exit(1);
+                }
+            }
+            "-g" => {
+                i += 1;
+                if i < args.len() {
+                    game_file = args[i].clone();
+                    println!("游戏档配置文件: {}", game_file);
+                } else {
+                    eprintln!("错误: -g 需要指定配置文件路径");
                     process::exit(1);
                 }
             }
@@ -164,6 +229,31 @@ fn main() {
     // 绑核日志：写入 <配置文件目录>/logs/apply.log（排障/验证规则命中用）
     crate::cache::init_apply_log(&config_file);
 
+    // 游戏档配置（可选）：存在则启用档位切换，包名名单供前台检测使用
+    let mut game_mtime: i64 = -1;
+    if fs::metadata(&game_file).is_ok() {
+        if let Some(game_cfg) = load_config(&game_file, &topo, &mut game_mtime) {
+            *lock_ignore_poison(&GAME_PKGS) = Some(Arc::new(game_cfg.pkgs.clone()));
+            println!(
+                "游戏档配置: {}（{} 个游戏包），前台自动检测已启用",
+                game_file,
+                game_cfg.pkgs.len()
+            );
+        } else {
+            eprintln!("警告: 游戏档配置 {} 解析失败，档位切换禁用", game_file);
+        }
+    } else {
+        println!("未找到游戏档配置 {}，档位切换禁用（仅省电档）", game_file);
+    }
+
+    // 档位检测线程：前台游戏检测 + 手动 override（mode 文件），档位变化时置 MODE_CHANGED
+    let mode_file = Path::new(&config_file)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("mode");
+    let det_interval = Duration::from_secs((2 * sleep_interval).max(2));
+    let mut mode_handle = spawn_mode_detector(mode_file.clone(), det_interval);
+
     // 守护进程模式，保存 JoinHandle 用于 panic 恢复检测
     let mut config_handle = thread::spawn(move || {
         config_loader(sleep_interval);
@@ -178,6 +268,9 @@ fn main() {
     let mut ebpf_state: Option<EbpfState> = ebpf_init();
     #[cfg(not(feature = "ebpf"))]
     let mut ebpf_state: Option<()> = None;
+    let mut last_ebpf_retry = Instant::now();
+    // 切档失败日志节流：30 秒内只打印一次，避免损坏文件时每轮刷屏
+    let mut last_mode_fail_log = Instant::now();
 
     loop {
         // 先 swap CONFIG_UPDATED 再获取 cfg 防止漏更新
@@ -187,12 +280,91 @@ fn main() {
             continue;
         };
 
+        // 档位切换：目标档位变化时现场加载对应配置并替换生效配置
+        if MODE_CHANGED.swap(false, Ordering::AcqRel) {
+            let target = *lock_ignore_poison(&CURRENT_MODE);
+            let effective = *lock_ignore_poison(&EFFECTIVE_MODE);
+            if target != effective {
+                let target_file = if target == Mode::Game {
+                    &game_file
+                } else {
+                    &config_file
+                };
+                // 现场强制加载（mtime=-1），成功后下一轮按 CONFIG_UPDATED 重建白名单/全量扫描
+                let mut dummy_mtime: i64 = -1;
+                if let Some(new_cfg) = load_config(target_file, &cfg.topo, &mut dummy_mtime) {
+                    if target == Mode::Game {
+                        *lock_ignore_poison(&GAME_PKGS) = Some(Arc::new(new_cfg.pkgs.clone()));
+                    }
+                    *lock_ignore_poison(&CURRENT_CONFIG) = Some(Arc::new(new_cfg));
+                    CONFIG_UPDATED.store(true, Ordering::Release);
+                    *lock_ignore_poison(&EFFECTIVE_MODE) = target;
+                    println!("档位生效: {:?}（配置 {}）", target, target_file);
+                } else {
+                    if last_mode_fail_log.elapsed() >= Duration::from_secs(30) {
+                        eprintln!(
+                            "警告: 加载 {:?} 档配置 {} 失败，保持当前档位（每30秒重试）",
+                            target, target_file
+                        );
+                        last_mode_fail_log = Instant::now();
+                    }
+                    // 保留目标档位并重新置位，下轮重试，避免"文件损坏+游戏在前台"时永久失配
+                    MODE_CHANGED.store(true, Ordering::Release);
+                }
+            }
+        }
+
+        // 一致性自愈：切档与 config_loader 热加载交错时（最后写者赢）可能出现
+        // CURRENT_CONFIG 与 EFFECTIVE_MODE 失配，每轮校验并强制恢复
+        {
+            let expected_file = if *lock_ignore_poison(&EFFECTIVE_MODE) == Mode::Game {
+                game_file.as_str()
+            } else {
+                config_file.as_str()
+            };
+            let cfg_file = lock_ignore_poison(&CURRENT_CONFIG)
+                .as_ref()
+                .map(|c| c.config_file.clone());
+            if cfg_file.as_deref() != Some(expected_file) {
+                let mut dummy_mtime: i64 = -1;
+                if let Some(new_cfg) = load_config(expected_file, &cfg.topo, &mut dummy_mtime) {
+                    *lock_ignore_poison(&CURRENT_CONFIG) = Some(Arc::new(new_cfg));
+                    CONFIG_UPDATED.store(true, Ordering::Release);
+                } else {
+                    eprintln!(
+                        "警告: 档位一致性自愈失败，无法加载 {}（可能已损坏或被删除）",
+                        expected_file
+                    );
+                }
+            }
+        }
+
+        // game.conf 热加载检查：省电档时 config_loader 只监控主配置，游戏配置
+        // 变更由主循环轮询 mtime 感知（切到游戏档后同时替换生效配置并重建白名单）
+        if fs::metadata(&game_file).is_ok() {
+            if let Some(new_game) = load_config(&game_file, &cfg.topo, &mut game_mtime) {
+                let new_pkgs = new_game.pkgs.clone();
+                println!("游戏档配置已热加载: {} 个游戏包", new_pkgs.len());
+                *lock_ignore_poison(&GAME_PKGS) = Some(Arc::new(new_pkgs));
+                if *lock_ignore_poison(&EFFECTIVE_MODE) == Mode::Game {
+                    *lock_ignore_poison(&CURRENT_CONFIG) = Some(Arc::new(new_game));
+                    CONFIG_UPDATED.store(true, Ordering::Release);
+                }
+            }
+        }
+
         // 配置加载线程 panic 恢复
         if config_handle.is_finished() {
             eprintln!("警告: 配置加载线程异常退出，尝试重启...");
             config_handle = thread::spawn(move || {
                 config_loader(sleep_interval);
             });
+        }
+
+        // 档位检测线程 panic 恢复
+        if mode_handle.is_finished() {
+            eprintln!("警告: 档位检测线程异常退出，尝试重启...");
+            mode_handle = spawn_mode_detector(mode_file.clone(), det_interval);
         }
 
         #[cfg(feature = "ebpf")]
@@ -249,6 +421,20 @@ fn main() {
                 affinity_deadline = Instant::now();
             }
         } else {
+            // eBPF 不可用（初始化失败/通道断开/重载失败），回退 /proc 轮询；
+            // 每 EBPF_RETRY_SECS 秒重试恢复，成功后自动切回事件驱动
+            if last_ebpf_retry.elapsed() >= Duration::from_secs(EBPF_RETRY_SECS) {
+                last_ebpf_retry = Instant::now();
+                if let Some(mut new_es) = ebpf_init() {
+                    if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
+                        eprintln!("eBPF: 自愈后白名单容量仍不足，继续 /proc 轮询");
+                    } else {
+                        full_scan(&cfg, &mut new_es);
+                        ebpf_state = Some(new_es);
+                        println!("eBPF: 自愈成功，恢复事件驱动模式");
+                    }
+                }
+            }
             let cache = proc_state.get_or_insert_with(ProcScanState::new);
             if config_changed {
                 cache.scan_all_proc = true;

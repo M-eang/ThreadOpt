@@ -13,6 +13,31 @@ use threadopt::rule_match::{comm_to_pkg, thread_affinity};
 /// 绑核日志路径（配置文件同目录 logs/apply.log），未初始化时为 None（日志禁用）
 static APPLY_LOG_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+/// 单份日志大小上限，超过后滚动保留最近 APPLY_LOG_BACKUPS 份备份
+const APPLY_LOG_MAX_BYTES: u64 = 1024 * 1024;
+const APPLY_LOG_BACKUPS: usize = 3;
+
+/// apply.log 的第 n 份备份路径（apply.log.1 / apply.log.2 / ...）
+fn apply_log_backup(path: &Path, n: usize) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{}", n));
+    PathBuf::from(name)
+}
+
+/// 日志超限滚动：apply.log → .1 → .2 → .3，丢弃最旧备份，失败静默
+fn roll_apply_log(path: &Path) {
+    let _ = fs::remove_file(apply_log_backup(path, APPLY_LOG_BACKUPS));
+    for i in (1..APPLY_LOG_BACKUPS).rev() {
+        let src = apply_log_backup(path, i);
+        if src.exists() {
+            let _ = fs::rename(&src, apply_log_backup(path, i + 1));
+        }
+    }
+    if path.exists() {
+        let _ = fs::rename(path, apply_log_backup(path, 1));
+    }
+}
+
 /// 初始化绑核日志路径，日志写入 <配置文件目录>/logs/apply.log（目录不存在则创建）
 pub fn init_apply_log(config_file: &str) {
     let path = Path::new(config_file)
@@ -26,7 +51,7 @@ pub fn init_apply_log(config_file: &str) {
     let _ = APPLY_LOG_PATH.set(path);
 }
 
-/// 记录一次绑核动作（失败静默，不影响主逻辑；超 1MB 滚动清空）
+/// 记录一次绑核动作（失败静默，不影响主逻辑；超 1MB 滚动保留最近 3 份备份）
 pub fn log_apply(tid: i32, comm: &str, pkg: &str, cpus: &str, is_thread_rule: bool) {
     let Some(Some(path)) = APPLY_LOG_PATH.get() else {
         return;
@@ -53,10 +78,10 @@ pub fn log_apply(tid: i32, comm: &str, pkg: &str, cpus: &str, is_thread_rule: bo
         if is_thread_rule { "thread" } else { "package" }
     );
     if fs::metadata(&path)
-        .map(|m| m.len() > 1024 * 1024)
+        .map(|m| m.len() > APPLY_LOG_MAX_BYTES)
         .unwrap_or(false)
     {
-        let _ = fs::write(&path, b"");
+        roll_apply_log(&path);
     }
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
