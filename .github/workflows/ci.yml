@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: 格式检查
+        working-directory: ThreadOpt
+        run: cargo fmt --check
+
+      - name: 单元测试（含 eBPF feature 全量编译）
+        working-directory: ThreadOpt
+        run: cargo test
+
+      - name: 安装 Android NDK（r27d）
+        run: |
+          yes | ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+          ${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager --install "ndk;27.2.12479018" --channel=0
+
+      - name: Android 交叉编译（aarch64）
+        working-directory: ThreadOpt
+        run: |
+          rustup target add aarch64-linux-android
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="${ANDROID_SDK_ROOT}/ndk/27.2.12479018/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          cargo build --release --target aarch64-linux-android
+
+      - name: 发布构建（Android 目标产物验证）
+        working-directory: ThreadOpt
+        run: cargo build --release
+
+  ebpf-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: 安装 bpf-linker（官方预编译版）
+        run: |
+          curl -sL -o /tmp/bpf-linker.tar.zst \
+            https://github.com/aya-rs/bpf-linker/releases/download/v0.10.4/bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          python3 -m pip install zstandard --quiet
+          python3 -c "import zstandard; zstandard.ZstdDecompressor().copy_stream(open('/tmp/bpf-linker.tar.zst','rb'), open('/tmp/out.tar','wb'))"
+          tar -xf /tmp/out.tar -C /usr/local/bin
+          chmod +x /usr/local/bin/bpf-linker
+
+      - name: 编译 eBPF 内核态（bpfel-unknown-none）
+        working-directory: ThreadOpt-ebpf
+        run: |
+          rustup target add bpfel-unknown-none --toolchain nightly || true
+          cargo +nightly build -Z build-std=core --target bpfel-unknown-none --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ThreadOpt-ebpf
+          path: ThreadOpt-ebpf/target/bpfel-unknown-none/release/ThreadOpt-ebpf
+

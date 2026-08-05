@@ -1,0 +1,298 @@
+#![cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_pointer_width = "32")]
+compile_error!("ThreadOpt requires 64-bit target due to cpu_set_t binary layout assumptions");
+
+mod apply_affinity;
+mod cache;
+mod ebpf_mode;
+mod proc_mode;
+
+use std::env;
+use std::fs;
+use std::process;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[cfg(feature = "ebpf")]
+use crate::ebpf_mode::{
+    EbpfState, affinity_check, comm_map_init, ebpf_init, event_dispatch, full_scan,
+};
+use crate::proc_mode::{ProcScanState, cache_sync};
+use threadopt::CONFIG_UPDATED;
+use threadopt::config::{CURRENT_CONFIG, config_loader, init_inotify, load_config};
+use threadopt::cpuset::{DEFAULT_CPUSET_NAME, init_cpu_topo, set_base_cpuset};
+use threadopt::lock_ignore_poison;
+
+fn print_help(prog_name: &str) {
+    println!("Usage: {} [OPTIONS]", prog_name);
+    println!("Options:");
+    println!("  -c <config_file>   指定配置文件 (默认: ./applist.conf)");
+    println!("  -s <interval>      设置检查间隔(秒) (必须>=1, 默认: 2)");
+    println!("  -b <cpuset_name>   指定 BASE_CPUSET 目录名 (默认: ThreadOpt)");
+    println!("  -v                 显示程序版本");
+    println!("  -h                 显示帮助信息");
+    println!();
+    println!("示例:");
+    println!("  {} -c /data/applist.conf -s 3", prog_name);
+    println!("  {} -b MyThreadOpt", prog_name);
+    println!();
+    println!("规则格式:");
+    println!("  # 注释以 # 或 // 开头");
+    println!("  com.example=0-3           包级规则，绑定到 CPU 0-3");
+    println!("  com.example=e-core        语义核心，绑定到全部小核");
+    println!("  com.example=p-core        语义核心，绑定到全部中核");
+    println!("  com.example=hp-core       语义核心，绑定到全部大核");
+    println!();
+    println!("  块语法，包级规则 + 线程规则");
+    println!("  com.example {{");
+    println!("    RenderThread=6-7");
+    println!("    Thread-1=0-5");
+    println!("  }}");
+    println!("  线程 RenderThread 绑定到 CPU 6-7");
+    println!("  线程 Thread-1 绑定到 CPU 0-5");
+}
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    let prog_name = &args[0];
+
+    let mut config_file = String::from("./applist.conf");
+    let mut sleep_interval: u64 = 2;
+    let mut cpuset_name = String::from(DEFAULT_CPUSET_NAME);
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-c" => {
+                i += 1;
+                if i < args.len() {
+                    config_file = args[i].clone();
+                    println!("配置文件: {}", config_file);
+                } else {
+                    eprintln!("错误: -c 需要指定配置文件路径");
+                    process::exit(1);
+                }
+            }
+            "-s" => {
+                i += 1;
+                if i < args.len() {
+                    let val: u64 = match args[i].parse() {
+                        Ok(v) if v >= 1 => v,
+                        _ => {
+                            eprintln!("无效的时间间隔: {}", args[i]);
+                            eprintln!("间隔必须是 >=1 的整数");
+                            process::exit(1);
+                        }
+                    };
+                    sleep_interval = val;
+                    println!("检查间隔: {} 秒", sleep_interval);
+                } else {
+                    eprintln!("错误: -s 需要指定时间间隔");
+                    process::exit(1);
+                }
+            }
+            "-b" => {
+                i += 1;
+                if i < args.len() {
+                    cpuset_name = args[i].clone();
+                    if cpuset_name.is_empty() || cpuset_name.contains('/') {
+                        eprintln!("无效的 cpuset 目录名: {}", args[i]);
+                        eprintln!("目录名不能为空或包含路径分隔符");
+                        process::exit(1);
+                    }
+                    println!("cpuset 目录名: {}", cpuset_name);
+                } else {
+                    eprintln!("错误: -b 需要指定 cpuset 目录名");
+                    process::exit(1);
+                }
+            }
+            "-v" => {
+                #[cfg(feature = "ebpf")]
+                let ebpf_ok = crate::ebpf_mode::ebpf_probe();
+                #[cfg(not(feature = "ebpf"))]
+                let ebpf_ok = false;
+                if ebpf_ok {
+                    println!("ThreadOpt 版本 {} eBPF", env!("CARGO_PKG_VERSION"));
+                } else {
+                    println!("ThreadOpt 版本 {}", env!("CARGO_PKG_VERSION"));
+                }
+                process::exit(0);
+            }
+            "-h" => {
+                print_help(prog_name);
+                process::exit(0);
+            }
+            other => {
+                eprintln!("未知选项: {}", other);
+                print_help(prog_name);
+                process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    // 先设置 cpuset 路径再初始化拓扑，init_cpu_topo 会创建 BASE_CPUSET 目录
+    set_base_cpuset(&cpuset_name);
+    let topo = init_cpu_topo();
+
+    if fs::metadata(&config_file).is_err() {
+        let initial_content = "# 规则编写与使用说明请参考 http://AppOpt.suto.top\n\n";
+        if fs::write(&config_file, initial_content).is_ok() {
+            println!("配置文件不存在，重建一个空的配置文件: {}", config_file);
+        }
+    }
+
+    let mut tmp_mtime: i64 = -1;
+    let initial_config = match load_config(&config_file, &topo, &mut tmp_mtime) {
+        Some(cfg) => cfg,
+        None => {
+            eprintln!("初始配置加载失败");
+            process::exit(1);
+        }
+    };
+
+    {
+        let mut guard = lock_ignore_poison(&CURRENT_CONFIG);
+        *guard = Some(Arc::new(initial_config));
+    }
+    CONFIG_UPDATED.store(true, Ordering::Release);
+
+    init_inotify(&config_file);
+
+    // 绑核日志：写入 <配置文件目录>/logs/apply.log（排障/验证规则命中用）
+    crate::cache::init_apply_log(&config_file);
+
+    // 守护进程模式，保存 JoinHandle 用于 panic 恢复检测
+    let mut config_handle = thread::spawn(move || {
+        config_loader(sleep_interval);
+    });
+
+    let mut proc_state: Option<ProcScanState> = None;
+    let mut affinity_deadline = Instant::now();
+
+    println!("启动ThreadOpt服务 v{}", env!("CARGO_PKG_VERSION"));
+
+    #[cfg(feature = "ebpf")]
+    let mut ebpf_state: Option<EbpfState> = ebpf_init();
+    #[cfg(not(feature = "ebpf"))]
+    let mut ebpf_state: Option<()> = None;
+
+    loop {
+        // 先 swap CONFIG_UPDATED 再获取 cfg 防止漏更新
+        let config_changed = CONFIG_UPDATED.swap(false, Ordering::AcqRel);
+        let Some(cfg) = lock_ignore_poison(&CURRENT_CONFIG).clone() else {
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        };
+
+        // 配置加载线程 panic 恢复
+        if config_handle.is_finished() {
+            eprintln!("警告: 配置加载线程异常退出，尝试重启...");
+            config_handle = thread::spawn(move || {
+                config_loader(sleep_interval);
+            });
+        }
+
+        #[cfg(feature = "ebpf")]
+        let mut ebpf_dead = false;
+
+        #[cfg(feature = "ebpf")]
+        let need_reload = if let Some(es) = ebpf_state.as_mut() {
+            if config_changed {
+                let r = comm_map_init(&mut es.bpf, &cfg.pkgs, es.comm_capacity);
+                if !r {
+                    full_scan(&cfg, es);
+                }
+                r
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        #[cfg(not(feature = "ebpf"))]
+        let need_reload = false;
+
+        #[cfg(feature = "ebpf")]
+        if need_reload {
+            ebpf_state = None;
+            if let Some(mut new_es) = ebpf_init() {
+                if comm_map_init(&mut new_es.bpf, &cfg.pkgs, new_es.comm_capacity) {
+                    eprintln!("eBPF: 重载后白名单容量仍不足，回退到 /proc 轮询");
+                    continue;
+                }
+                full_scan(&cfg, &mut new_es);
+                ebpf_state = Some(new_es);
+            }
+            continue;
+        }
+
+        #[cfg(feature = "ebpf")]
+        if let Some(es) = ebpf_state.as_mut() {
+            match es.event_rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(event) => {
+                    event_dispatch(&event, &cfg, es);
+                    while let Ok(event) = es.event_rx.try_recv() {
+                        event_dispatch(&event, &cfg, es);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    ebpf_dead = true;
+                }
+            }
+
+            if affinity_deadline.elapsed() >= Duration::from_secs(3 * sleep_interval) {
+                affinity_check(es, &cfg);
+                affinity_deadline = Instant::now();
+            }
+        } else {
+            let cache = proc_state.get_or_insert_with(ProcScanState::new);
+            if config_changed {
+                cache.scan_all_proc = true;
+                cache.last_proc_count = 0;
+            }
+            cache_sync(cache, &cfg);
+            if affinity_deadline.elapsed() >= Duration::from_secs(5 * sleep_interval)
+                || cache.force_affinity
+            {
+                cache.cache.affinity_sync(&cfg.topo);
+                affinity_deadline = Instant::now();
+                cache.force_affinity = false;
+            }
+            thread::sleep(Duration::from_secs(sleep_interval));
+        }
+
+        #[cfg(not(feature = "ebpf"))]
+        {
+            // 纯 /proc 轮询模式（无 eBPF 支持构建时）
+            let cache = proc_state.get_or_insert_with(ProcScanState::new);
+            if config_changed {
+                cache.scan_all_proc = true;
+                cache.last_proc_count = 0;
+            }
+            cache_sync(cache, &cfg);
+            if affinity_deadline.elapsed() >= Duration::from_secs(5 * sleep_interval)
+                || cache.force_affinity
+            {
+                cache.cache.affinity_sync(&cfg.topo);
+                affinity_deadline = Instant::now();
+                cache.force_affinity = false;
+            }
+            thread::sleep(Duration::from_secs(sleep_interval));
+        }
+
+        #[cfg(feature = "ebpf")]
+        if ebpf_dead {
+            eprintln!("eBPF: 事件通道断开，回退到 /proc 轮询");
+            ebpf_state = None;
+            let cache = proc_state.get_or_insert_with(ProcScanState::new);
+            cache.scan_all_proc = true;
+            cache.last_proc_count = 0;
+            cache.force_affinity = true;
+            affinity_deadline = Instant::now();
+        }
+    }
+}

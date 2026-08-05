@@ -1,0 +1,27 @@
+[package]
+name = "ThreadOpt"
+version = "2.2.1"
+edition = "2024"
+
+[lib]
+name = "threadopt"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ThreadOpt"
+path = "src/main.rs"
+
+[features]
+default = ["ebpf"]
+ebpf = ["dep:aya"]
+
+[dependencies]
+libc = "0.2"
+
+aya = { version = "0.14", optional = true }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

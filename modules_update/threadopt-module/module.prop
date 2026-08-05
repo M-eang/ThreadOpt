@@ -1,0 +1,7 @@
+id=ThreadOpt
+name=ThreadOpt 线程优化
+version=2.2.1
+versionCode=162
+author=hang-meng
+description=安卓应用线程 CPU 亲和性优化程序（基于 AppOpt 的 Rust 重构版）
+updateJson=https://github.com/M-eang/ThreadOpt/raw/main/modules_update/ThreadOpt.json
